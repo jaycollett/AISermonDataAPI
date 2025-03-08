@@ -39,7 +39,7 @@ def generate_sermon_analysis(text):
     3. **Bible Books & Verses**: List **all Bible books and specific verse references** mentioned.
     4. **Sermon Style**: Determine if the sermon is **Expository, Topical, Narrative, or Doctrinal**.
     5. **Sentiment**: Identify the **overall tone** (Encouraging, Uplifting, Warning, Teaching, Reflective).
-    6. **Key Quotes**: Provide **1-2 of the most impactful quotes** from the sermon.
+    6. **Key Quotes**: Provide **2-4 of the most impactful or significant quotes** from the sermon.
 
     **Return all outputs in both English and Mexican Spanish.**
     

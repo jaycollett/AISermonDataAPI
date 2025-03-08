@@ -6,7 +6,7 @@ import sqlite3
 import os
 
 # API Base URL
-BASE_URL = "http://localhost:5099"  # Update if running on a different host/port
+BASE_URL = "https://localhost:5555"  # Update if running on a different host/port
 
 # Database file
 DB_FILE = "sermons.db"
