@@ -4,6 +4,7 @@ import logging
 import codecs
 from datetime import datetime
 from aiWork import generate_sermon_analysis
+from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -24,12 +25,28 @@ def decode_unicode(text):
     return text  # Return unchanged if None or not a string
 
 def process_sermon_jobs():
-    """Processes pending sermons and extracts insights."""
+    """Processes pending sermons, extracts insights, and cleans up old finished jobs."""
     while True:
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
 
+            # Cleanup old jobs:
+            # Delete jobs with status 'completed' or 'error'
+            # that have an updated_at timestamp 24 or more hours ago.
+            cutoff_time = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                """
+                DELETE FROM sermons 
+                WHERE (status = 'completed' OR status = 'error') 
+                  AND updated_at IS NOT NULL 
+                  AND updated_at <= ?
+                """,
+                (cutoff_time,)
+            )
+            conn.commit()
+
+            # Process pending sermons
             cursor.execute("SELECT * FROM sermons WHERE status = 'pending' LIMIT 5")
             sermons = cursor.fetchall()
 
@@ -43,7 +60,8 @@ def process_sermon_jobs():
 
                 try:
                     # Extract AI-generated insights
-                    summary_en, summary_es, topics_en, topics_es, bible_refs_en, bible_refs_es, sermon_style_en, sermon_style_es, sentiment_en, sentiment_es, key_quotes_en, key_quotes_es = generate_sermon_analysis(transcription)
+                    summary_en, summary_es, topics_en, topics_es, bible_refs_en, bible_refs_es, \
+                    sermon_style_en, sermon_style_es, sentiment_en, sentiment_es, key_quotes_en, key_quotes_es = generate_sermon_analysis(transcription)
 
                     # Ensure proper UTF-8 handling before saving to the database
                     summary_es = decode_unicode(summary_es)
@@ -53,11 +71,9 @@ def process_sermon_jobs():
                     sentiment_es = decode_unicode(sentiment_es)
                     key_quotes_es = decode_unicode(key_quotes_es)
 
-
-
                     finished_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-                    # Update database
+                    # Update database with completed job
                     cursor.execute(
                         """UPDATE sermons 
                            SET ai_summary = ?, ai_summary_es = ?, bible_books = ?, bible_books_es = ?, 
@@ -65,7 +81,9 @@ def process_sermon_jobs():
                                sentiment = ?, sentiment_es = ?, key_quotes = ?, key_quotes_es = ?, 
                                status = 'completed', updated_at = ?
                            WHERE id = ?""",
-                        (summary_en, summary_es, bible_refs_en, bible_refs_es, topics_en, topics_es, sermon_style_en, sermon_style_es, sentiment_en, sentiment_es, key_quotes_en, key_quotes_es, finished_at, sermon_id)
+                        (summary_en, summary_es, bible_refs_en, bible_refs_es,
+                         topics_en, topics_es, sermon_style_en, sermon_style_es,
+                         sentiment_en, sentiment_es, key_quotes_en, key_quotes_es, finished_at, sermon_id)
                     )
                     conn.commit()
 
@@ -73,6 +91,7 @@ def process_sermon_jobs():
 
                 except Exception as e:
                     logging.error(f"❌ Error processing sermon {sermon_guid}: {e}")
+                    # Optionally, update updated_at here for error cases if you want them cleaned up later
                     cursor.execute("UPDATE sermons SET status = 'error' WHERE id = ?", (sermon_id,))
                     conn.commit()
 
@@ -81,8 +100,7 @@ def process_sermon_jobs():
         except Exception as e:
             logging.error(f"🚨 Worker error: {e}")
             time.sleep(PROCESS_INTERVAL)
-
-
+            
 if __name__ == "__main__":
     logging.info("🔥 Starting sermon processing worker...")
     process_sermon_jobs()
