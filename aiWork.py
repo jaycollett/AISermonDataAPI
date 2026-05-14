@@ -18,8 +18,8 @@ from pathlib import Path
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Max wall time for a single Claude Code CLI invocation. Opus with --effort high
-# on a long transcription can take a couple of minutes.
+# Max wall time for a single Claude Code CLI invocation. Opus with --effort medium
+# on a long transcription typically completes in 20-60s; 300s is a safety ceiling.
 CLAUDE_TIMEOUT_SECONDS = 300
 
 # Threshold above which the prompt is piped via stdin instead of -p. Most shells
@@ -120,7 +120,7 @@ def _invoke_claude(prompt: str) -> str:
         "--allowedTools", "",
         "--max-turns", "2",
         "--model", "claude-opus-4-7",
-        "--effort", "high",
+        "--effort", "medium",
     ]
 
     env = os.environ.copy()
