@@ -91,8 +91,14 @@ def process_sermon_jobs():
 
                 except Exception as e:
                     logging.error(f"❌ Error processing sermon {sermon_guid}: {e}")
-                    # Optionally, update updated_at here for error cases if you want them cleaned up later
-                    cursor.execute("UPDATE sermons SET status = 'error' WHERE id = ?", (sermon_id,))
+                    # Set updated_at on error rows so the 24h cleanup query can
+                    # eventually purge them. Without this, errored rows linger
+                    # forever and orchestrators polling for them block forever.
+                    error_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    cursor.execute(
+                        "UPDATE sermons SET status = 'error', updated_at = ? WHERE id = ?",
+                        (error_at, sermon_id),
+                    )
                     conn.commit()
 
             conn.close()
