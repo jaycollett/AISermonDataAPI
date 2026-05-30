@@ -8,6 +8,7 @@ The function signature `generate_sermon_analysis(text)` returns the same
 12-tuple as before so the synchronous worker loop does not need to change.
 """
 
+import json
 import logging
 import os
 import re
@@ -214,35 +215,113 @@ def generate_sermon_analysis(text):
     )
 
 
+# Coalesce raw transcription segments into ~this many seconds per block before
+# prompting. The chapter granularity we want (5-12 over a ~30 min sermon) is far
+# coarser than the raw ~1-5s segments, so blocking keeps the prompt compact
+# without losing the resolution needed to place a chapter start.
+CHAPTER_BLOCK_SECONDS = 20.0
+
+
+def _build_chapters_prompt(timings):
+    """Coalesce timed segments into ~CHAPTER_BLOCK_SECONDS blocks and build the
+    chapter-segmentation prompt. Each block is one line: "[<seconds>] <text>"."""
+    blocks = []
+    block_start = None
+    parts = []
+    for seg in timings:
+        try:
+            start = float(seg.get("start") or 0.0)
+        except (TypeError, ValueError):
+            start = 0.0
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        if block_start is None:
+            block_start = start
+        parts.append(text)
+        if start - block_start >= CHAPTER_BLOCK_SECONDS:
+            blocks.append((int(block_start), " ".join(parts)))
+            block_start = None
+            parts = []
+    if parts:
+        blocks.append((int(block_start or 0.0), " ".join(parts)))
+
+    transcript = "\n".join(f"[{s}] {t}" for s, t in blocks)
+
+    return f"""You are segmenting a Christian sermon into chapter markers for an audio player.
+
+Below is the sermon transcript as timestamped blocks, one per line, formatted "[<seconds>] <text>" where <seconds> is the audio position in whole seconds.
+
+Identify between 5 and 12 natural chapters — major shifts in the sermon such as the opening/welcome, the scripture reading, each main teaching point, a key illustration, the application, and the closing/benediction. For each chapter provide:
+- "start": the integer audio position in seconds where the chapter begins (use the [seconds] value of the block where it starts)
+- "label_en": a short, descriptive English title in Title Case, 2 to 6 words, no trailing punctuation
+- "label_es": the Mexican Spanish translation of label_en
+
+Requirements:
+- The first chapter MUST have "start": 0.
+- Chapters MUST be ordered by increasing start and must not repeat a start value.
+- Prefer specific, content-based titles over generic ones.
+- Output between 5 and 12 chapters depending on the sermon's length and structure.
+
+Return ONLY a JSON array and nothing else, in exactly this shape:
+[
+  {{"start": 0, "label_en": "Welcome and Prayer", "label_es": "Bienvenida y oración"}},
+  {{"start": 95, "label_en": "Reading from Matthew 21", "label_es": "Lectura de Mateo 21"}}
+]
+
+Transcript:
+{transcript}
+"""
+
+
+def _parse_chapters_response(content):
+    """Extract the JSON array of chapters from the model's response. Lenient on
+    surrounding prose/markdown fences; the worker's _normalize_chapters does the
+    final validation (labels present, sort, renumber, cap)."""
+    match = re.search(r"\[.*\]", content, re.DOTALL)
+    if not match:
+        raise RuntimeError("No JSON array found in chapters response")
+    data = json.loads(match.group(0))
+    if not isinstance(data, list):
+        raise RuntimeError("Chapters response is not a JSON array")
+
+    chapters = []
+    for ch in data:
+        if not isinstance(ch, dict):
+            continue
+        try:
+            start = int(round(float(ch.get("start"))))
+        except (TypeError, ValueError):
+            continue  # unusable start — drop this entry
+        chapters.append({
+            "start_seconds": max(0, start),
+            "label_en": str(ch.get("label_en") or "").strip(),
+            "label_es": str(ch.get("label_es") or "").strip(),
+        })
+    return chapters
+
+
 def generate_chapters(timings):
-    """Condense transcription timings into chapter markers.  *** OWNER TODO ***
+    """Condense transcription timings into chapter markers via the Claude CLI.
 
-    The surrounding plumbing (DB job table, /submit_chapters + /chapters_status
-    routes, the worker loop, output validation, and the orchestrator that feeds
-    this and forwards the result to the web app) is all in place. Only this
-    function body is left to implement — the actual LLM condensing logic.
+    Input — `timings`: a time-ordered list of segment dicts (English only), each
+    {"start": float_seconds, "end": float_seconds, "text": str}.
 
-    Input — `timings`: a time-ordered list of segment dicts, English only
-    (~1,300 segments for a 30-min sermon), each:
-        {"start": float_seconds, "end": float_seconds, "text": str}
-
-    Return — a list of 5-12 chapter dicts:
-        {"idx": int, "start_seconds": int, "label_en": str, "label_es": str}
-      • start_seconds  — whole seconds; floor of the chapter's first segment start
-      • label_en       — short, descriptive English title (~2-6 words)
-      • label_es       — Mexican-Spanish translation of label_en
-
-    The worker (worker._normalize_chapters) re-sorts by start_seconds, renumbers
-    idx, caps labels at 120 chars, and rejects the job (status='error') if the
-    result is empty or any chapter is missing a label — so partial/garbage
-    output is safe and simply re-runs.
-
-    Implementation: reuse the Claude Code CLI plumbing in this module — build a
-    prompt from the segment text + timestamps, call `_invoke_claude(prompt)`,
-    and parse the response into the list above. Mirror the bilingual EN/ES
-    pattern in generate_sermon_analysis() (English title + Mexican-Spanish
-    translation in one call).
+    Return — a list of chapter dicts {"start_seconds": int, "label_en": str,
+    "label_es": str}, earliest first, with the first chapter forced to start at 0.
+    The worker (worker._normalize_chapters) renumbers idx, caps labels, re-sorts,
+    and rejects the job (status='error') if the result is empty or any chapter is
+    missing a label — so partial/garbage output is safe and simply re-runs.
     """
-    raise NotImplementedError(
-        "generate_chapters() is not implemented yet — owner to add the condensing logic"
-    )
+    if not isinstance(timings, list) or not timings:
+        raise RuntimeError("generate_chapters received empty timings")
+
+    prompt = _build_chapters_prompt(timings)
+    content = _invoke_claude(prompt)
+    chapters = _parse_chapters_response(content)
+
+    chapters.sort(key=lambda c: c["start_seconds"])
+    if chapters:
+        # Guarantee coverage from the very start of the audio.
+        chapters[0]["start_seconds"] = 0
+    return chapters
