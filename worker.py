@@ -1,9 +1,10 @@
 import sqlite3
+import json
 import time
 import logging
 import codecs
 from datetime import datetime
-from aiWork import generate_sermon_analysis
+from aiWork import generate_sermon_analysis, generate_chapters
 from datetime import datetime, timedelta
 
 # Configure logging
@@ -107,6 +108,100 @@ def process_sermon_jobs():
             logging.error(f"🚨 Worker error: {e}")
             time.sleep(PROCESS_INTERVAL)
             
+def _normalize_chapters(raw):
+    """Validate + normalize the condenser's output before it is stored.
+
+    Accepts the list returned by generate_chapters() and returns a clean list
+    of {idx, start_seconds, label_en, label_es} sorted by start_seconds with idx
+    renumbered 0..n. Raises ValueError on anything unusable so the worker's
+    try/except flips the row to status='error' (and the job re-runs later).
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("generate_chapters returned no chapters")
+
+    cleaned = []
+    for seg in raw:
+        if not isinstance(seg, dict):
+            raise ValueError("chapter entry is not an object")
+        start = int(seg["start_seconds"])
+        label_en = str(seg.get("label_en") or "").strip()
+        label_es = str(seg.get("label_es") or "").strip()
+        if start < 0 or not label_en or not label_es:
+            raise ValueError("chapter missing start_seconds or a label")
+        cleaned.append({
+            "start_seconds": start,
+            "label_en": label_en[:120],
+            "label_es": label_es[:120],
+        })
+
+    cleaned.sort(key=lambda c: c["start_seconds"])
+    for i, c in enumerate(cleaned):
+        c["idx"] = i
+    return cleaned
+
+
+def process_chapter_jobs():
+    """Processes pending chapter-condensing jobs: reads the stored timings, runs
+    the LLM condenser, and stores the resulting markers. Fully independent of
+    the sermon AI-content worker (its own table + loop)."""
+    while True:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            # Cleanup: purge completed/error chapter jobs older than 24h.
+            cutoff_time = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                """
+                DELETE FROM chapters
+                WHERE (status = 'completed' OR status = 'error')
+                  AND updated_at IS NOT NULL
+                  AND updated_at <= ?
+                """,
+                (cutoff_time,),
+            )
+            conn.commit()
+
+            cursor.execute("SELECT * FROM chapters WHERE status = 'pending' LIMIT 5")
+            jobs = cursor.fetchall()
+
+            if not jobs:
+                logging.info("⏳ No pending chapter jobs. Waiting...")
+
+            for job in jobs:
+                chapter_id = job["id"]
+                sermon_guid = job["sermon_guid"]
+
+                try:
+                    timings = json.loads(job["timings_json"])
+                    chapters = _normalize_chapters(generate_chapters(timings))
+
+                    finished_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    cursor.execute(
+                        """UPDATE chapters
+                           SET chapters_json = ?, status = 'completed', updated_at = ?
+                           WHERE id = ?""",
+                        (json.dumps(chapters), finished_at, chapter_id),
+                    )
+                    conn.commit()
+                    logging.info(f"✅ Chapters for {sermon_guid} generated ({len(chapters)} markers).")
+
+                except Exception as e:
+                    logging.error(f"❌ Error generating chapters for {sermon_guid}: {e}")
+                    error_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    cursor.execute(
+                        "UPDATE chapters SET status = 'error', updated_at = ? WHERE id = ?",
+                        (error_at, chapter_id),
+                    )
+                    conn.commit()
+
+            conn.close()
+            time.sleep(PROCESS_INTERVAL)
+        except Exception as e:
+            logging.error(f"🚨 Chapter worker error: {e}")
+            time.sleep(PROCESS_INTERVAL)
+
+
 if __name__ == "__main__":
     logging.info("🔥 Starting sermon processing worker...")
     process_sermon_jobs()

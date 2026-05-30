@@ -212,3 +212,37 @@ def generate_sermon_analysis(text):
         bible_refs_en, bible_refs_es, sermon_style_en, sermon_style_es,
         sentiment_en, sentiment_es, key_quotes_en, key_quotes_es,
     )
+
+
+def generate_chapters(timings):
+    """Condense transcription timings into chapter markers.  *** OWNER TODO ***
+
+    The surrounding plumbing (DB job table, /submit_chapters + /chapters_status
+    routes, the worker loop, output validation, and the orchestrator that feeds
+    this and forwards the result to the web app) is all in place. Only this
+    function body is left to implement — the actual LLM condensing logic.
+
+    Input — `timings`: a time-ordered list of segment dicts, English only
+    (~1,300 segments for a 30-min sermon), each:
+        {"start": float_seconds, "end": float_seconds, "text": str}
+
+    Return — a list of 5-12 chapter dicts:
+        {"idx": int, "start_seconds": int, "label_en": str, "label_es": str}
+      • start_seconds  — whole seconds; floor of the chapter's first segment start
+      • label_en       — short, descriptive English title (~2-6 words)
+      • label_es       — Mexican-Spanish translation of label_en
+
+    The worker (worker._normalize_chapters) re-sorts by start_seconds, renumbers
+    idx, caps labels at 120 chars, and rejects the job (status='error') if the
+    result is empty or any chapter is missing a label — so partial/garbage
+    output is safe and simply re-runs.
+
+    Implementation: reuse the Claude Code CLI plumbing in this module — build a
+    prompt from the segment text + timestamps, call `_invoke_claude(prompt)`,
+    and parse the response into the list above. Mirror the bilingual EN/ES
+    pattern in generate_sermon_analysis() (English title + Mexican-Spanish
+    translation in one call).
+    """
+    raise NotImplementedError(
+        "generate_chapters() is not implemented yet — owner to add the condensing logic"
+    )
