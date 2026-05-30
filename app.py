@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify, g
 import sqlite3
+import json
+import uuid
 import os
 import time
 import logging
 import threading
-from worker import process_sermon_jobs
+from worker import process_sermon_jobs, process_chapter_jobs
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,6 +44,17 @@ def init_db():
                 sentiment_es TEXT DEFAULT NULL,
                 key_quotes TEXT DEFAULT NULL,
                 key_quotes_es TEXT DEFAULT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chapters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sermon_guid TEXT NOT NULL UNIQUE,
+                timings_json TEXT NOT NULL,
+                chapters_json TEXT DEFAULT NULL,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT NULL
@@ -113,6 +126,97 @@ def get_sermon_status(sermon_guid):
         return jsonify({"error": str(e)}), 500
 
 
+def _is_uuid(value):
+    """True if value parses as a UUID."""
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+@app.route('/submit_chapters', methods=['POST'])
+def submit_chapters():
+    """Submit a sermon's transcription timings for chapter-marker condensing.
+
+    Independent of the /submit_sermon AI-content job. Re-submission is
+    idempotent: an existing row is reset to 'pending' with fresh timings and a
+    cleared result, so backfill and re-runs work without a 409.
+
+    Payload: {sermon_guid, timings: [{start: float, end: float, text: str}, ...]}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        sermon_guid = data.get('sermon_guid')
+        timings = data.get('timings')
+
+        if not _is_uuid(sermon_guid):
+            return jsonify({"error": "Missing or invalid sermon_guid"}), 400
+        if not isinstance(timings, list) or not timings:
+            return jsonify({"error": "timings must be a non-empty list"}), 400
+        for i, seg in enumerate(timings):
+            if (not isinstance(seg, dict)
+                    or not isinstance(seg.get('start'), (int, float))
+                    or not isinstance(seg.get('end'), (int, float))
+                    or not str(seg.get('text') or '').strip()):
+                return jsonify(
+                    {"error": f"segment {i} needs numeric start/end and non-empty text"}
+                ), 400
+
+        timings_json = json.dumps(timings)
+
+        db = get_db()
+        cursor = db.cursor()
+        # UPSERT keyed on sermon_guid: insert new, or reset an existing row back
+        # to 'pending' with the fresh timings (idempotent for backfill/re-runs).
+        cursor.execute("SELECT id FROM chapters WHERE sermon_guid = ?", (sermon_guid,))
+        if cursor.fetchone():
+            cursor.execute(
+                """UPDATE chapters
+                   SET timings_json = ?, chapters_json = NULL,
+                       status = 'pending', updated_at = NULL
+                   WHERE sermon_guid = ?""",
+                (timings_json, sermon_guid),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO chapters (sermon_guid, timings_json, status) "
+                "VALUES (?, ?, 'pending')",
+                (sermon_guid, timings_json),
+            )
+        db.commit()
+
+        return jsonify({"message": "Chapters job submitted"}), 201
+
+    except Exception as e:
+        logging.exception("Error processing chapters submission.")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/chapters_status/<sermon_guid>', methods=['GET'])
+def get_chapters_status(sermon_guid):
+    """Status + result for a chapters job. chapters is [] until completed."""
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT sermon_guid, status, chapters_json, created_at, updated_at "
+            "FROM chapters WHERE sermon_guid = ?",
+            (sermon_guid,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return jsonify({"error": "Chapters job not found."}), 404
+
+        result = dict(row)
+        result["chapters"] = json.loads(result.pop("chapters_json") or "[]")
+        return jsonify(result), 200
+
+    except Exception as e:
+        logging.exception("Error retrieving chapters status.")
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     logging.info("🔥 Initializing the database...")
     init_db()  # 💡 Ensure this runs before anything else
@@ -123,6 +227,10 @@ if __name__ == "__main__":
     time.sleep(5)
     worker_thread = threading.Thread(target=process_sermon_jobs, daemon=True)
     worker_thread.start()
+
+    logging.info("🔥 Starting chapters worker thread...")
+    chapter_thread = threading.Thread(target=process_chapter_jobs, daemon=True)
+    chapter_thread.start()
 
     logging.info("✅ Sermon API Server started successfully.")
     app.run(host="0.0.0.0", port=5090, debug=True, use_reloader=False)
