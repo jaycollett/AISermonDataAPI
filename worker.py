@@ -4,7 +4,7 @@ import time
 import logging
 import codecs
 from datetime import datetime
-from aiWork import generate_sermon_analysis, generate_chapters
+from aiWork import generate_sermon_analysis, generate_chapters, embed_chunks
 from datetime import datetime, timedelta
 
 # Configure logging
@@ -199,6 +199,93 @@ def process_chapter_jobs():
             time.sleep(PROCESS_INTERVAL)
         except Exception as e:
             logging.error(f"🚨 Chapter worker error: {e}")
+            time.sleep(PROCESS_INTERVAL)
+
+
+def _process_embedding_cycle(conn):
+    """Run one embedding-worker cycle on `conn`: purge old jobs, then embed every
+    pending job's languages. Extracted from the loop so it is directly testable
+    (a temp DB + a mocked embed_chunks) without spinning the infinite loop."""
+    cursor = conn.cursor()
+
+    # Cleanup: purge completed/error embedding jobs older than 24h.
+    cutoff_time = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        """
+        DELETE FROM embeddings
+        WHERE (status = 'completed' OR status = 'error')
+          AND updated_at IS NOT NULL
+          AND updated_at <= ?
+        """,
+        (cutoff_time,),
+    )
+    conn.commit()
+
+    cursor.execute("SELECT * FROM embeddings WHERE status = 'pending' LIMIT 5")
+    jobs = cursor.fetchall()
+
+    if not jobs:
+        logging.info("⏳ No pending embedding jobs. Waiting...")
+
+    for job in jobs:
+        embedding_id = job["id"]
+        sermon_guid = job["sermon_guid"]
+
+        try:
+            texts = json.loads(job["payload_json"])
+            if not isinstance(texts, dict) or not texts:
+                raise ValueError("payload_json has no texts to embed")
+
+            # Embed each provided language. embed_chunks raises on any
+            # failed/short vector, which the outer except turns into
+            # status='error' for the whole job.
+            result = {}
+            for lang in ("en", "es"):
+                text = texts.get(lang)
+                if isinstance(text, str) and text.strip():
+                    result[lang] = embed_chunks(text)
+
+            if not result:
+                raise ValueError("no en/es text present to embed")
+
+            finished_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                """UPDATE embeddings
+                   SET result_json = ?, status = 'completed', updated_at = ?
+                   WHERE id = ?""",
+                (json.dumps(result), finished_at, embedding_id),
+            )
+            conn.commit()
+            counts = ", ".join(f"{lang}={len(chunks)}" for lang, chunks in result.items())
+            logging.info(f"✅ Embeddings for {sermon_guid} generated ({counts}).")
+
+        except Exception as e:
+            logging.error(f"❌ Error generating embeddings for {sermon_guid}: {e}")
+            error_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute(
+                "UPDATE embeddings SET status = 'error', updated_at = ? WHERE id = ?",
+                (error_at, embedding_id),
+            )
+            conn.commit()
+
+
+def process_embedding_jobs():
+    """Processes pending embedding jobs: reads the stored transcription text(s),
+    chunks each language the way the web app does, embeds every chunk with bge-m3,
+    and stores the per-language vectors. Fully independent of the sermon AI-content
+    and chapter workers (its own table + loop).
+
+    A single failed embed in any language raises out of embed_chunks and flips the
+    whole row to status='error' (so it re-runs) — the web app rejects a POST whose
+    vectors are the wrong length, so a partial result is never stored."""
+    while True:
+        try:
+            conn = get_db_connection()
+            _process_embedding_cycle(conn)
+            conn.close()
+            time.sleep(PROCESS_INTERVAL)
+        except Exception as e:
+            logging.error(f"🚨 Embedding worker error: {e}")
             time.sleep(PROCESS_INTERVAL)
 
 
