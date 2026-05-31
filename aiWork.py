@@ -325,3 +325,185 @@ def generate_chapters(timings):
         # Guarantee coverage from the very start of the audio.
         chapters[0]["start_seconds"] = 0
     return chapters
+
+
+# ---------------------------------------------------------------------------
+# Embeddings (bge-m3 via Ollama)
+#
+# This block produces the semantic-search chunk embeddings the web app stores
+# at /api/sermon_embeddings. The web app validates each chunk's vector length
+# EXACTLY (== EMBED_DIM, default 1024) and rejects the whole POST otherwise, so
+# everything here raises on the first bad/empty embedding rather than emitting a
+# short vector — the worker then flips the job to status='error' and it re-runs.
+#
+# CRITICAL — chunk-boundary parity: the chunking below is a verbatim copy of the
+# web app's sermon_search/utils/text.py::split_transcript_to_paragraphs (and its
+# helper _bucket_plain_paragraphs + PARAGRAPH_TARGET_LENGTH). The boundaries MUST
+# match the corpus backfill (build_utils/embed_sermons.py) so re-embeds line up.
+# If you change the splitter in the web app, change it here too. The embed call
+# is the requests-based equivalent of text web app's services/embeddings.py::embed_text.
+# ---------------------------------------------------------------------------
+
+import html as _html
+
+import bleach
+import requests
+
+# Sentence-bucketing target — copied from the web app's text.py so chunk
+# boundaries are identical to the corpus backfill.
+PARAGRAPH_TARGET_LENGTH = 665
+
+# Mirror embed_sermons.py: chunks shorter than this are skipped (too small to
+# carry useful signal, and the web app would reject an empty-ish vector anyway).
+EMBED_MIN_CHARS = 20
+
+# Expected bge-m3 dimensionality. The web app rejects any chunk whose vector is
+# not exactly this length, so we assert it here before returning.
+EMBED_DIM = 1024
+
+# Per-chunk Ollama timeout. Matches embed_sermons.py (which uses 30s for the
+# backfill, vs the web app's 8s query-time default).
+EMBED_TIMEOUT_SECONDS = 30.0
+
+_entity_unescape = _html.unescape
+
+
+def _bucket_plain_paragraphs(text, min_length=PARAGRAPH_TARGET_LENGTH):
+    """Sentence-bucket plain text into paragraphs of roughly ``min_length``.
+
+    Verbatim copy of the web app's text.py helper of the same name. Keep in
+    sync with sermon_search/utils/text.py so embedding chunk boundaries match
+    the corpus backfill.
+    """
+    if not text:
+        return []
+    if "\n\n" in text:
+        return [p.strip() for p in text.split("\n\n") if p.strip()]
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    paragraphs = []
+    current_para = ""
+    for sentence in sentences:
+        candidate = current_para + " " + sentence if current_para else sentence
+        if len(candidate) < min_length:
+            current_para = candidate
+        else:
+            paragraphs.append(candidate.strip())
+            current_para = ""
+    if current_para:
+        paragraphs.append(current_para.strip())
+    paragraphs = [p for p in paragraphs if p]
+
+    # A run with no sentence breaks (an unpunctuated transcript) buckets into
+    # one oversized paragraph above; hard-split anything well over target into
+    # word windows so it stays readable and embeddable.
+    hard_cap = min_length * 2
+    bounded = []
+    for para in paragraphs:
+        if len(para) <= hard_cap:
+            bounded.append(para)
+            continue
+        window = ""
+        for word in para.split():
+            cand = (window + " " + word) if window else word
+            if len(cand) < min_length:
+                window = cand
+            else:
+                bounded.append(cand)
+                window = ""
+        if window:
+            bounded.append(window)
+    return bounded
+
+
+def split_transcript_to_paragraphs(text, min_length=PARAGRAPH_TARGET_LENGTH):
+    """Return a list of plain-text paragraphs from a stored transcript.
+
+    Verbatim copy of the web app's text.py::split_transcript_to_paragraphs.
+    Strips ALL HTML with a single bleach pass, splitting on existing ``<p>``
+    boundaries the markup carried (if any) before bleaching so they survive,
+    otherwise sentence-buckets the prose. Keep in sync with the web app.
+    """
+    if not text:
+        return []
+    raw = str(text)
+    if "<p" in raw:
+        chunks = []
+        for chunk in raw.split("</p>"):
+            cleaned = bleach.clean(chunk, tags=[], strip=True)
+            cleaned = _entity_unescape(cleaned).strip()
+            if cleaned:
+                chunks.append(cleaned)
+        if chunks:
+            return chunks
+        # Fall through to sentence bucketing if the split produced nothing.
+    plain = _entity_unescape(bleach.clean(raw, tags=[], strip=True))
+    return _bucket_plain_paragraphs(plain, min_length=min_length)
+
+
+def _embed_text(text):
+    """Embed a single chunk via the bge-m3 Ollama. Raises on any failure.
+
+    requests-based equivalent of the web app's services/embeddings.py::embed_text
+    (which uses httpx + a query cache). Same HTTP contract: POST
+    {OLLAMA_BASE_URL}/api/embeddings with {"model": "bge-m3", "prompt": text},
+    read the float vector from the "embedding" key. Reads OLLAMA_BASE_URL and the
+    model name (EMBED_MODEL, default bge-m3) from the environment.
+
+    Unlike the web app's query path (which returns None and falls back to keyword
+    search), this RAISES on failure: the corpus path must not silently drop a
+    chunk, and the worker's try/except turns a raise into status='error'.
+    """
+    base = (os.environ.get("OLLAMA_BASE_URL") or "").rstrip("/")
+    text = (text or "").strip()
+    if not base:
+        raise RuntimeError("OLLAMA_BASE_URL is not set; cannot reach the bge-m3 Ollama.")
+    if not text:
+        raise ValueError("_embed_text received empty text")
+
+    model = os.environ.get("EMBED_MODEL", "bge-m3")
+    resp = requests.post(
+        base + "/api/embeddings",
+        json={"model": model, "prompt": text},
+        timeout=EMBED_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    emb = resp.json().get("embedding")
+    if not isinstance(emb, list) or not emb:
+        raise RuntimeError("Ollama returned no embedding vector")
+    if len(emb) != EMBED_DIM:
+        # The web app rejects any chunk whose vector is not exactly EMBED_DIM,
+        # so fail loudly here rather than shipping a vector it will 400 on.
+        raise RuntimeError(
+            f"Embedding has {len(emb)} dims, expected {EMBED_DIM}"
+        )
+    return emb
+
+
+def embed_chunks(text):
+    """Chunk a transcript and embed each chunk with bge-m3.
+
+    Input — ``text``: one language's full transcription (the stored HTML/plain
+    transcript). Splitting REPLICATES the web app's split_transcript_to_paragraphs
+    so chunk boundaries match the corpus backfill.
+
+    Return — ``[{"idx": int, "text": str, "embedding": [float x EMBED_DIM]}]``,
+    one entry per kept chunk. ``idx`` is the paragraph's position in the original
+    split (chunks under EMBED_MIN_CHARS are skipped, mirroring embed_sermons.py,
+    so idx values may have gaps — this matches the corpus backfill, which keeps
+    the original enumerate() index too).
+
+    Raises on the first embed failure so the worker marks the job status='error'.
+    Raises ValueError if the transcript yields no usable chunks.
+    """
+    paragraphs = split_transcript_to_paragraphs(text)
+    chunks = []
+    for idx, para in enumerate(paragraphs):
+        para = (para or "").strip()
+        if len(para) < EMBED_MIN_CHARS:
+            continue
+        embedding = _embed_text(para)
+        chunks.append({"idx": idx, "text": para, "embedding": embedding})
+
+    if not chunks:
+        raise ValueError("embed_chunks produced no usable chunks from transcript")
+    return chunks
