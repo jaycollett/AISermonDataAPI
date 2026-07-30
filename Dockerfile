@@ -14,7 +14,7 @@
 # The apk package tracks Alpine's security updates and is multi-arch.
 
 # ---- Stage 1: build the Python virtualenv ----
-FROM python:3.13-alpine AS python-build
+FROM python:3.14-alpine AS python-build
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -29,7 +29,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ---- Stage 2: install the Claude Code CLI ----
-FROM python:3.13-alpine AS node-build
+FROM python:3.14-alpine AS node-build
 
 RUN apk add --no-cache nodejs npm libstdc++
 
@@ -40,7 +40,7 @@ RUN npm install -g --prefix /opt/node-cli @anthropic-ai/claude-code \
     && PATH="/opt/node-cli/bin:$PATH" claude --version
 
 # ---- Stage 3: runtime ----
-FROM python:3.13-alpine
+FROM python:3.14-alpine
 
 LABEL org.opencontainers.image.source="https://github.com/jaycollett/AISermonDataAPI"
 LABEL org.opencontainers.image.description="AI sermon analysis API backed by the Claude Code CLI"
