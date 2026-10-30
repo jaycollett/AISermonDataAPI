@@ -365,6 +365,21 @@ EMBED_DIM = 1024
 # backfill, vs the web app's 8s query-time default).
 EMBED_TIMEOUT_SECONDS = 30.0
 
+# Hard ceiling on the text sent to bge-m3 in one request. The Ollama runs with
+# num_ctx=4096 and returns HTTP 500 "the input length exceeds the context
+# length" for anything longer. This is a character limit sized for realistic
+# text, not a token guarantee for arbitrary input. Measured against the live
+# model, 2000 chars is ~500 tokens of sermon prose and ~2000 tokens of dense
+# punctuation or emoji, well under 4096. Pathological input can still overflow
+# it (2000 copies of U+FDFA, for example), and Ollama then fails the job the
+# same way it did before the cap.
+#
+# The sentence-bucketing path never produces more than 2x
+# PARAGRAPH_TARGET_LENGTH (1330 chars), so the cap only touches paragraphs
+# from the <p> and blank-line paths, which are passed through unbounded. Every
+# transcript that embedded before this cap existed chunks identically.
+EMBED_MAX_CHARS = 2000
+
 _entity_unescape = _html.unescape
 
 
@@ -440,6 +455,51 @@ def split_transcript_to_paragraphs(text, min_length=PARAGRAPH_TARGET_LENGTH):
     return _bucket_plain_paragraphs(plain, min_length=min_length)
 
 
+def _split_on_whitespace(text, max_chars):
+    """Greedy word windows of at most ``max_chars``. A single word longer than
+    ``max_chars`` is sliced by character so the cap holds for any input."""
+    windows = []
+    window = ""
+    for word in text.split():
+        while len(word) > max_chars:
+            if window:
+                windows.append(window)
+                window = ""
+            windows.append(word[:max_chars])
+            word = word[max_chars:]
+        if not word:
+            continue
+        cand = (window + " " + word) if window else word
+        if len(cand) <= max_chars:
+            window = cand
+        else:
+            windows.append(window)
+            window = word
+    if window:
+        windows.append(window)
+    return windows
+
+
+def _cap_paragraph(para, max_chars=EMBED_MAX_CHARS):
+    """Return ``para`` as one or more pieces, each at most ``max_chars`` long.
+
+    A paragraph already under the cap comes back unchanged as a single piece.
+    An oversized one (typically a whole transcript that came through the <p>
+    path as one chunk because "<p" also matches tags like <possible-scripture>)
+    is sentence-bucketed the same way plain transcripts are, and anything still
+    over the cap after that is split on whitespace.
+    """
+    if len(para) <= max_chars:
+        return [para]
+    pieces = []
+    for sub in _bucket_plain_paragraphs(para):
+        if len(sub) <= max_chars:
+            pieces.append(sub)
+        else:
+            pieces.extend(_split_on_whitespace(sub, max_chars))
+    return pieces
+
+
 def _embed_text(text):
     """Embed a single chunk via the bge-m3 Ollama. Raises on any failure.
 
@@ -459,6 +519,10 @@ def _embed_text(text):
         raise RuntimeError("OLLAMA_BASE_URL is not set; cannot reach the bge-m3 Ollama.")
     if not text:
         raise ValueError("_embed_text received empty text")
+    if len(text) > EMBED_MAX_CHARS:
+        raise ValueError(
+            f"_embed_text received {len(text)} chars, over EMBED_MAX_CHARS={EMBED_MAX_CHARS}"
+        )
 
     model = os.environ.get("EMBED_MODEL", "bge-m3")
     resp = requests.post(
@@ -492,13 +556,19 @@ def embed_chunks(text):
     so idx values may have gaps — this matches the corpus backfill, which keeps
     the original enumerate() index too).
 
+    Paragraphs over EMBED_MAX_CHARS are split into smaller pieces before
+    embedding, and ``idx`` then counts pieces rather than paragraphs, so it stays
+    unique. A transcript with no oversized paragraph gets the same idx values as
+    the corpus backfill.
+
     Raises on the first embed failure so the worker marks the job status='error'.
     Raises ValueError if the transcript yields no usable chunks.
     """
-    paragraphs = split_transcript_to_paragraphs(text)
+    paragraphs = []
+    for para in split_transcript_to_paragraphs(text):
+        paragraphs.extend(_cap_paragraph((para or "").strip()))
     chunks = []
     for idx, para in enumerate(paragraphs):
-        para = (para or "").strip()
         if len(para) < EMBED_MIN_CHARS:
             continue
         embedding = _embed_text(para)
