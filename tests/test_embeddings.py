@@ -390,3 +390,120 @@ def test_embed_text_raises_without_base_url(monkeypatch):
     monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
     with pytest.raises(RuntimeError, match="OLLAMA_BASE_URL"):
         aiWork._embed_text("trust God")
+
+
+# ---------------------------------------------------------------------------
+# EMBED_MAX_CHARS: nothing over the cap may reach Ollama (num_ctx=4096 there
+# returns HTTP 500 "the input length exceeds the context length").
+# ---------------------------------------------------------------------------
+
+def _fake_ollama(sent):
+    """Stand-in for _embed_text that fails the way Ollama does on long input."""
+    import aiWork
+
+    def fake(text):
+        if len(text) > aiWork.EMBED_MAX_CHARS:
+            raise RuntimeError("the input length exceeds the context length")
+        sent.append(text)
+        return [0.5] * 1024
+
+    return fake
+
+
+def _sentences(n):
+    return " ".join(f"Sentence number {i} talks about grace and mercy." for i in range(n))
+
+
+def test_embed_chunks_caps_transcript_misread_as_html(monkeypatch):
+    """A plain transcript carrying <possible-scripture> tags matches the "<p"
+    check, has no </p> to split on, and comes back as one paragraph holding the
+    whole transcript. This is the shape of the Spanish transcripts that failed
+    in production. It must be split into sentence-bucketed pieces under the cap."""
+    import aiWork
+
+    text = (
+        _sentences(80)
+        + " <possible-scripture>Juan 3:16</possible-scripture> "
+        + _sentences(80)
+    )
+    assert len(aiWork.split_transcript_to_paragraphs(text)) == 1  # the oversized input
+
+    sent = []
+    monkeypatch.setattr(aiWork, "_embed_text", _fake_ollama(sent))
+    chunks = aiWork.embed_chunks(text)
+
+    assert len(chunks) > 1
+    assert all(len(c["text"]) <= aiWork.EMBED_MAX_CHARS for c in chunks)
+    assert [c["idx"] for c in chunks] == list(range(len(chunks)))
+    # Sentence-bucketed, so pieces end on a sentence break, and no words are lost.
+    assert all(c["text"].endswith(".") for c in chunks)
+    plain = aiWork.split_transcript_to_paragraphs(text)[0]
+    assert " ".join(c["text"] for c in chunks).split() == plain.split()
+
+
+def test_embed_chunks_caps_run_on_blank_line_paragraph(monkeypatch):
+    """The blank-line path returns paragraphs unbounded. A long paragraph with no
+    sentence punctuation falls back to a whitespace split under the cap."""
+    import aiWork
+
+    run_on = " ".join(f"word{i}" for i in range(2000))  # ~15k chars, no periods
+    text = "Opening paragraph that is long enough.\n\n" + run_on + "\n\nClosing paragraph that is long enough."
+
+    sent = []
+    monkeypatch.setattr(aiWork, "_embed_text", _fake_ollama(sent))
+    chunks = aiWork.embed_chunks(text)
+
+    assert all(len(c["text"]) <= aiWork.EMBED_MAX_CHARS for c in chunks)
+    assert chunks[0]["text"] == "Opening paragraph that is long enough."
+    assert chunks[-1]["text"] == "Closing paragraph that is long enough."
+    assert " ".join(c["text"] for c in chunks[1:-1]).split() == run_on.split()
+    idxs = [c["idx"] for c in chunks]
+    assert idxs == list(range(len(chunks)))
+
+
+def test_embed_chunks_slices_single_word_over_cap(monkeypatch):
+    """Whitespace splitting can't break a token longer than the cap, so it is
+    sliced by character."""
+    import aiWork
+
+    blob = "x" * (aiWork.EMBED_MAX_CHARS * 2 + 30)
+    text = "<p>Short intro paragraph here.</p><p>" + blob + "</p>"
+
+    sent = []
+    monkeypatch.setattr(aiWork, "_embed_text", _fake_ollama(sent))
+    chunks = aiWork.embed_chunks(text)
+
+    assert [len(c["text"]) for c in chunks] == [
+        len("Short intro paragraph here."), aiWork.EMBED_MAX_CHARS, aiWork.EMBED_MAX_CHARS, 30,
+    ]
+    assert "".join(c["text"] for c in chunks[1:]) == blob
+
+
+def test_embed_chunks_unchanged_when_no_paragraph_over_cap(monkeypatch):
+    """Transcripts that already fit keep the exact chunks and idx values the
+    corpus backfill produces, so stored embeddings stay consistent."""
+    import aiWork
+
+    text = _sentences(60)
+    paragraphs = aiWork.split_transcript_to_paragraphs(text)
+    assert max(len(p) for p in paragraphs) <= aiWork.EMBED_MAX_CHARS
+
+    monkeypatch.setattr(aiWork, "_embed_text", lambda t: [0.5] * 1024)
+    chunks = aiWork.embed_chunks(text)
+
+    assert [(c["idx"], c["text"]) for c in chunks] == [
+        (i, p) for i, p in enumerate(paragraphs) if len(p) >= aiWork.EMBED_MIN_CHARS
+    ]
+
+
+def test_embed_text_rejects_text_over_cap_without_calling_ollama(monkeypatch):
+    import aiWork
+
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama.test:11434")
+
+    def fail_post(*a, **k):
+        raise AssertionError("must not POST oversized text")
+
+    monkeypatch.setattr(aiWork.requests, "post", fail_post)
+    with pytest.raises(ValueError, match="EMBED_MAX_CHARS"):
+        aiWork._embed_text("a" * (aiWork.EMBED_MAX_CHARS + 1))
