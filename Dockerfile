@@ -28,6 +28,11 @@ RUN python -m venv /opt/venv
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Nothing installs packages at runtime, so the venv ships without pip. Its
+# vendored copies of urllib3, msgpack and setuptools are what Trivy flagged
+# (HIGH, fixable), and they lag pip's own releases.
+RUN /opt/venv/bin/python -m pip uninstall -y pip
+
 # ---- Stage 2: install the Claude Code CLI ----
 FROM python:3.13-alpine AS node-build
 
@@ -56,6 +61,9 @@ ENV PYTHONUNBUFFERED=1 \
 # nodejs is the CLI's interpreter; npm is deliberately left out of the runtime.
 # ca-certificates backs the outbound HTTPS both the CLI and the app make.
 RUN apk add --no-cache nodejs ca-certificates libffi openssl libstdc++
+
+# Same reason as the venv: drop the base interpreter's pip too.
+RUN /usr/local/bin/python3 -m pip uninstall -y pip
 
 COPY --from=python-build /opt/venv /opt/venv
 COPY --from=node-build /opt/node-cli /opt/node-cli
