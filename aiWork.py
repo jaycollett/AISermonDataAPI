@@ -367,9 +367,12 @@ EMBED_TIMEOUT_SECONDS = 30.0
 
 # Hard ceiling on the text sent to bge-m3 in one request. The Ollama runs with
 # num_ctx=4096 and returns HTTP 500 "the input length exceeds the context
-# length" for anything longer. Measured against the live model, 2000 chars is
-# ~500 tokens of sermon prose and at most ~2000 tokens for adversarial input
-# (punctuation, emoji), so this stays under 4096 with room to spare.
+# length" for anything longer. This is a character limit sized for realistic
+# text, not a token guarantee for arbitrary input. Measured against the live
+# model, 2000 chars is ~500 tokens of sermon prose and ~2000 tokens of dense
+# punctuation or emoji, well under 4096. Pathological input can still overflow
+# it (2000 copies of U+FDFA, for example), and Ollama then fails the job the
+# same way it did before the cap.
 #
 # The sentence-bucketing path never produces more than 2x
 # PARAGRAPH_TARGET_LENGTH (1330 chars), so the cap only touches paragraphs
@@ -566,7 +569,6 @@ def embed_chunks(text):
         paragraphs.extend(_cap_paragraph((para or "").strip()))
     chunks = []
     for idx, para in enumerate(paragraphs):
-        para = (para or "").strip()
         if len(para) < EMBED_MIN_CHARS:
             continue
         embedding = _embed_text(para)
