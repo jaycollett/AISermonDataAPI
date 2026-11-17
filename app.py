@@ -95,7 +95,28 @@ def submit_sermon():
         db = get_db()
         cursor = db.cursor()
 
-        # Check if sermon already exists
+        # A job that failed is requeued in place, so the caller can retry it by
+        # submitting again. Without this an errored row answered 409 until the
+        # 24h purge removed it. One guarded UPDATE, so two racing resubmits
+        # cannot both requeue.
+        cursor.execute('''
+            UPDATE sermons
+            SET transcription = ?, status = 'pending',
+                ai_summary = NULL, ai_summary_es = NULL,
+                bible_books = NULL, bible_books_es = NULL,
+                topics = NULL, topics_es = NULL,
+                sermon_style = NULL, sermon_style_es = NULL,
+                sentiment = NULL, sentiment_es = NULL,
+                key_quotes = NULL, key_quotes_es = NULL,
+                created_at = CURRENT_TIMESTAMP, updated_at = NULL
+            WHERE sermon_guid = ? AND status = 'error'
+        ''', (transcription, sermon_guid))
+        if cursor.rowcount:
+            db.commit()
+            logging.info(f"Errored sermon job requeued: {sermon_guid}")
+            return jsonify({"message": "Sermon submitted successfully"}), 201
+
+        # A pending or completed job keeps answering 409.
         cursor.execute("SELECT id FROM sermons WHERE sermon_guid = ?", (sermon_guid,))
         if cursor.fetchone():
             return jsonify({"error": "Sermon already exists"}), 409
